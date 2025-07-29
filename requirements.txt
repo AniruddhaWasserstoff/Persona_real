@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+streamlit
+pandas
+sentence-transformers
+qdrant-client
+hdbscan
+numpy
+requests
+python-dotenv
