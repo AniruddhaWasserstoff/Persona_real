@@ -3,6 +3,7 @@
 import os
 import json
 import logging
+import re
 from typing import List, Dict, Any
 
 from dotenv import load_dotenv
@@ -17,6 +18,7 @@ if not GROQ_API_KEY:
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
 # ─── Instantiate Groq LLM ────────────────────────────────────────────────────
 llm = ChatGroq(
     api_key=GROQ_API_KEY,
@@ -28,6 +30,7 @@ llm = ChatGroq(
     timeout=None
 )
 
+
 def _extract_json(raw: str) -> Dict[str, Any]:
     """
     Pull the first JSON object out of the LLM’s raw string.
@@ -35,12 +38,11 @@ def _extract_json(raw: str) -> Dict[str, Any]:
     text = raw.strip()
     # strip markdown fences
     if text.startswith("```"):
-        lines = text.splitlines()[1:]
-        text = "\n".join(lines)
+        text = text.split("```", 2)[-1]
     if text.endswith("```"):
-        lines = text.splitlines()[:-1]
-        text = "\n".join(lines)
+        text = text.rsplit("```", 1)[0]
 
+    # find balanced braces
     start = text.find("{")
     if start < 0:
         raise ValueError("No JSON object found in LLM output")
@@ -51,15 +53,17 @@ def _extract_json(raw: str) -> Dict[str, Any]:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return json.loads(text[start : i + 1])
+                obj_str = text[start : i + 1]
+                return json.loads(obj_str)
     raise ValueError("Unmatched braces in LLM output")
+
 
 def generate_personas(
     clusters: Dict[int, List[Dict[str, Any]]]
 ) -> List[Dict[str, Any]]:
     """
-    For each non-noise cluster, ask Groq’s Llama model (via ChatGroq)
-    to emit exactly one raw JSON persona object.
+    For each cluster, generate a persona JSON object via ChatGroq.
+    Ensures list fields use JSON arrays and normalizes set-like syntax.
     """
     personas: List[Dict[str, Any]] = []
 
@@ -67,26 +71,37 @@ def generate_personas(
         if label == -1:
             continue
 
-        # build the messages in the (role, content) tuple format
+        # 1) System prompt
         system_msg = (
             "system",
-            "You are a marketing strategist. OUTPUT MUST BE ONE RAW JSON OBJECT—"
-            "no markdown, no explanation, keys and string values in double quotes."
+            "You are an expert market researcher. "
+            "Output EXACTLY one RAW JSON object containing the keys: "
+            "persona_name (string), demographics (object), goals (object), "
+            "pain_points (array of strings), channels (object), "
+            "content_preferences (object), marketing_strategy (object). "
+            "Do NOT include any other keys. Use JSON arrays [\"item1\",\"item2\"] for lists."
         )
+        # 2) User prompt with cluster data
         human_msg = (
             "human",
-            "Cluster profiles:\n"
-            f"{json.dumps(members, ensure_ascii=False)}\n\n"
-            "1) Assign a unique persona_name.\n"
-            "2) Describe demographics, goals, pain_points, channels, content_preferences.\n"
-            "3) Recommend marketing_strategy with keys awareness, consideration, decision.\n\n"
-            "Return exactly one JSON object with keys: persona_name, demographics, goals, "
-            "pain_points, channels, content_preferences, marketing_strategy."
+            "Here are customer comments from one cluster—please derive a persona:\n" +
+            "\n".join(p.get("text", "") for p in members)
         )
 
+        # 3) Call LLM
         try:
             ai_msg = llm.invoke([system_msg, human_msg])
             raw = ai_msg.content
+
+            # 4) Normalize set-like pain_points to JSON arrays
+            raw = re.sub(
+                r'("pain_points"\s*:\s*)\{\s*([^}]+?)\s*\}',
+                lambda m: f"{m.group(1)}[{m.group(2).strip()}]",
+                raw,
+                flags=re.DOTALL
+            )
+
+            # 5) Extract JSON
             persona = _extract_json(raw)
             personas.append(persona)
             logger.info("Generated persona for cluster %d: %s", label, persona.get("persona_name"))

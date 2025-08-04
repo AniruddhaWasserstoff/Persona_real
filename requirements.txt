@@ -8,3 +8,8 @@ hdbscan
 numpy
 requests
 python-dotenv
+google-api-python-client
+langchain
+langchain-huggingface
+langchain-groq
+langdetect

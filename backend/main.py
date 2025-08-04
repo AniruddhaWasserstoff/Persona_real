@@ -12,6 +12,11 @@ from .clustering import cluster_embeddings
 from .persona_gen import generate_personas
 from .business import summarize_business, summarize_profile
 
+# ─── New routers ───────────────────────────────────────────────────────────────
+from .followup import router as followup_router
+from .youtube_router import router as youtube_router
+from .comment_personas import router as comment_personas_router
+
 # ─── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,7 +39,10 @@ class BizRequest(BaseModel):
 # ─── FastAPI app setup ──────────────────────────────────────────────────────────
 app = FastAPI(
     title="Persona & Business Profile Service",
-    description="Embed & cluster existing data into personas, summarize new-business inputs into profiles and human-readable summaries",
+    description=(
+        "Embed & cluster existing data into personas, "
+        "summarize new-business inputs into profiles and human-readable summaries"
+    ),
     version="1.0.0"
 )
 
@@ -96,9 +104,7 @@ async def summarize_business_endpoint(request: BizRequest) -> Dict[str, Any]:
     response_model=Dict[str, str],
     summary="Generate a human-readable summary from a structured business profile",
 )
-async def summarize_profile_endpoint(
-    profile: Dict[str, Any]
-) -> Dict[str, str]:
+async def summarize_profile_endpoint(profile: Dict[str, Any]) -> Dict[str, str]:
     """
     Expects the raw JSON returned by /summarize_business as the request body.
     """
@@ -110,3 +116,12 @@ async def summarize_profile_endpoint(
     except Exception as e:
         logger.exception("Error in /summarize_profile")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ─── Follow-up questions endpoint ──────────────────────────────────────────────
+app.include_router(followup_router, prefix="", tags=["followup"])
+
+# ─── YouTube comments endpoint ─────────────────────────────────────────────────
+app.include_router(youtube_router, prefix="", tags=["youtube"])
+
+# ─── Comment-based personas endpoint ──────────────────────────────────────────
+app.include_router(comment_personas_router, prefix="", tags=["personas"])
