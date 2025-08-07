@@ -1,16 +1,16 @@
-# backend/main.py
-
 import logging
+import os
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl
 
 from .embeddings import upsert_embeddings
 from .clustering import cluster_embeddings
 from .persona_gen import generate_personas
 from .business import summarize_business, summarize_profile
+from .webfill import SmartWebScraper
 
 # ─── New routers ───────────────────────────────────────────────────────────────
 from .followup import router as followup_router
@@ -35,6 +35,11 @@ class PersonasResponse(BaseModel):
 
 class BizRequest(BaseModel):
     business: Dict[str, Any] = Field(..., description="Raw new-business input data")
+
+class ExtractRequest(BaseModel):
+    website_url: HttpUrl = Field(..., description="URL of the business website to scrape")
+    max_pages:    int     = Field(25, description="Maximum number of pages to crawl")
+    max_workers:  int     = Field(2,  description="Number of parallel worker threads")
 
 # ─── FastAPI app setup ──────────────────────────────────────────────────────────
 app = FastAPI(
@@ -98,6 +103,43 @@ async def summarize_business_endpoint(request: BizRequest) -> Dict[str, Any]:
         logger.exception("Error in /summarize_business")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─── Website auto-fill endpoint ────────────────────────────────────────────────
+@app.post(
+    "/extract_business_info",
+    response_model=Dict[str, Any],
+    summary="Scrape a business website and auto-fill the profile fields",
+)
+async def extract_business_info(request: ExtractRequest) -> Dict[str, Any]:
+    logger.info(
+        "Extracting business info from URL=%s (pages=%d, workers=%d)",
+        request.website_url, request.max_pages, request.max_workers
+    )
+    try:
+        # Cast HttpUrl to str so that .rstrip() and other string methods work properly
+        scraper = SmartWebScraper(
+            base_url=str(request.website_url),
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            max_workers=request.max_workers,
+            max_pages=request.max_pages
+        )
+        results = scraper.run()
+        if not results or "final_summary" not in results:
+            logger.error("Scraper returned no summary or missing key")
+            raise HTTPException(status_code=500, detail="Website analysis failed")
+
+        # Map the free-form summary into your structured business profile
+        structured = summarize_business({
+            "summary": results["final_summary"]
+        })
+        logger.info("Auto-filled profile: %s", structured)
+        return structured
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error in /extract_business_info")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ─── Human-friendly summary from structured profile ───────────────────────────
 @app.post(
     "/summarize_profile",
@@ -105,9 +147,6 @@ async def summarize_business_endpoint(request: BizRequest) -> Dict[str, Any]:
     summary="Generate a human-readable summary from a structured business profile",
 )
 async def summarize_profile_endpoint(profile: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Expects the raw JSON returned by /summarize_business as the request body.
-    """
     logger.info("Received profile for summarization: %s", profile)
     try:
         summary = summarize_profile(profile)

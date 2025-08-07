@@ -1,10 +1,9 @@
-# frontend/app.py
-
 import streamlit as st
 import pandas as pd
 import requests
+import os
 
-API_BASE = "http://localhost:8000"
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 st.set_page_config(page_title="Business Toolkit", layout="wide")
 
 # Sidebar
@@ -12,16 +11,17 @@ st.sidebar.title("Tools")
 page = st.sidebar.radio("Choose a tool", ["Existing Customer", "New Customer"])
 
 # Session State Initialization
-defaults = {
+initial_state = {
     "personas_df": None,
     "personas": [],
     "business_profile": None,
     "business_summary": "",
     "followup_questions": [],
     "youtube_comments": {},
-    "comment_personas": []
+    "comment_personas": [],
+    "biz_defaults": {}
 }
-for key, val in defaults.items():
+for key, val in initial_state.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
@@ -49,7 +49,8 @@ if page == "Existing Customer":
             st.error("CSV missing required column: `customer_id`.")
             st.stop()
 
-        df = df.fillna({col: "" if df[col].dtype == object else df[col].median() for col in df.columns})
+        df = df.fillna({col: "" if df[col].dtype == object else df[col].median()
+                        for col in df.columns})
         st.session_state.personas_df = df
 
         try:
@@ -75,43 +76,105 @@ if page == "Existing Customer":
 # ---------------- New Customer ----------------
 else:
     st.title("New Customer Onboarding")
-    with st.form("biz_form"):
-        name = st.text_input("Business Name")
-        founded = st.number_input("Year Founded", min_value=1900, max_value=2025, value=2023)
-        locations = st.text_input("Location(s)", help="e.g. Mumbai; Pune")
-        offerings = st.text_area("Products / Services (comma-separated)")
-        price_range = st.text_input("Price Range (e.g. ₹200–₹800)")
-        audience = st.text_area("Ideal Customers (demographics, region)")
-        usp = st.text_area("Unique Selling Proposition")
-        competitors = st.text_area("Key Competitors")
-        channels = st.multiselect(
-            "Marketing Channels",
-            ["Email", "Social Media", "Events", "SEO", "Partnerships", "Paid Ads"]
-        )
-        goals = st.text_area("Top 3 Goals for Next Year")
-        submitted = st.form_submit_button("Generate Business Profile")
 
+    # 1) Auto-fill toggle and inputs
+    auto = st.checkbox("🌐 Auto-fill from website")
+    if auto:
+        website_url = st.text_input("Website URL", placeholder="https://example.com")
+        max_pages   = st.number_input("Max pages to scrape", min_value=1, max_value=100, value=25)
+        max_workers = st.number_input("Number of workers (threads)", min_value=1, max_value=10, value=2)
+
+        if st.button("Fetch data from site"):
+            try:
+                resp = requests.post(
+                    f"{API_BASE}/extract_business_info",
+                    json={
+                        "website_url": website_url,
+                        "max_pages":   max_pages,
+                        "max_workers": max_workers
+                    },
+                    timeout=120
+                )
+                resp.raise_for_status()
+                st.session_state.biz_defaults = resp.json()
+                st.success("Auto-fill data loaded. You can tweak the fields below.")
+            except requests.exceptions.RequestException as e:
+                st.error(f"Error fetching auto-fill data: {e}")
+
+    # 2) Prepare defaults for the form
+    raw = st.session_state.biz_defaults or {}
+    defaults = {
+        "name":        raw.get("name", ""),
+        "founded":     raw.get("founded", ""),
+        "locations":   ", ".join(raw.get("locations", [])),
+        "offerings":   ", ".join(raw.get("offerings", [])),
+        "price_range": raw.get("price_range", ""),
+        "audience":    ", ".join(raw.get("audience", [])),
+        "usp":         raw.get("usp", ""),
+        "competitors": ", ".join(raw.get("competitors", [])),
+        "goals":       "; ".join(raw.get("goals", [])),
+        "voice":       raw.get("voice", "")
+    }
+    ui_channel_options = ["Email", "Social Media", "Events", "SEO", "Partnerships", "Paid Ads"]
+    scraped = raw.get("channels", [])
+    default_channels = []
+    for s in scraped:
+        for opt in ui_channel_options:
+            if opt.lower() == s.lower():
+                default_channels.append(opt)
+                break
+    defaults["channels"] = default_channels
+
+    # 3) Business profile form
+    with st.form("biz_form"):
+        name        = st.text_input("Business Name", value=defaults["name"])
+        founded     = st.number_input(
+            "Year Founded", min_value=1900, max_value=2025,
+            value=int(defaults["founded"] or 2023)
+        )
+        locations   = st.text_input("Location(s)", value=defaults["locations"],
+                                    help="e.g. Mumbai; Pune")
+        offerings   = st.text_area("Products / Services (comma-separated)",
+                                   value=defaults["offerings"])
+        price_range = st.text_input("Price Range (e.g. ₹200–₹800)",
+                                    value=defaults["price_range"])
+        audience    = st.text_area("Ideal Customers (demographics, region)",
+                                   value=defaults["audience"])
+        usp         = st.text_area("Unique Selling Proposition",
+                                   value=defaults["usp"])
+        competitors = st.text_area("Key Competitors",
+                                   value=defaults["competitors"])
+        channels    = st.multiselect(
+            "Marketing Channels",
+            ui_channel_options,
+            default=defaults["channels"]
+        )
+        goals       = st.text_area("Top 3 Goals for Next Year",
+                                   value=defaults["goals"])
+        voice       = st.text_input("Brand Voice / Tone", value=defaults["voice"])
+        submitted   = st.form_submit_button("Generate Business Profile")
+
+    # 4) Reset button
     if st.button("Reset Data"):
-        st.session_state.business_profile = None
-        st.session_state.business_summary = ""
-        st.session_state.followup_questions = []
-        st.session_state.youtube_comments = {}
-        st.session_state.comment_personas = []
+        for k in ["business_profile","business_summary","followup_questions",
+                  "youtube_comments","comment_personas","biz_defaults"]:
+            st.session_state[k] = initial_state[k]
         st.rerun()
 
-    # Step 1: Generate business profile & summary
+    # 5) Summarize into structured profile & human summary
     if submitted:
         biz = {
-            "name": name,
-            "founded": str(founded),
-            "locations": locations,
-            "offerings": offerings,
+            "name":        name,
+            "founded":     str(founded),
+            "locations":   locations,
+            "offerings":   offerings,
             "price_range": price_range,
-            "audience": audience,
-            "usp": usp,
+            "audience":    audience,
+            "usp":         usp,
             "competitors": competitors,
-            "channels": channels,
-            "goals": goals
+            "channels":    channels,
+            "goals":       goals.split(";"),
+            "voice":       voice
         }
         try:
             resp = requests.post(
@@ -136,7 +199,7 @@ else:
         except requests.exceptions.RequestException as e:
             st.error(f"Summary API error: {e}")
 
-    # Display structured profile and summary
+    # 6) Display results and follow-up flow
     if st.session_state.business_profile:
         st.success("Structured Business Profile")
         st.json(st.session_state.business_profile)
@@ -145,7 +208,6 @@ else:
         st.subheader("Profile Summary")
         st.write(st.session_state.business_summary)
 
-        # Step 2: Generate Follow-Up Questions
         if st.button("1. Generate Follow-Up Questions"):
             try:
                 r1 = requests.post(
@@ -162,7 +224,6 @@ else:
             for i, q in enumerate(st.session_state.followup_questions, 1):
                 st.write(f"{i}. {q}")
 
-            # Step 3: Fetch YouTube Comments
             if st.button("2. Fetch YouTube Comments"):
                 try:
                     r2 = requests.post(
@@ -175,7 +236,6 @@ else:
                 except requests.exceptions.RequestException as e:
                     st.error(f"Error fetching YouTube comments: {e}")
 
-        # Display YouTube comments
         if st.session_state.youtube_comments:
             st.subheader("YouTube Comments")
             for question, comments in st.session_state.youtube_comments.items():
@@ -183,7 +243,6 @@ else:
                 for c in comments:
                     st.write(f"- {c}")
 
-            # Step 4: Generate Comment Personas
             if st.button("3. Generate Comment-Personas"):
                 try:
                     r3 = requests.post(
@@ -196,7 +255,6 @@ else:
                 except requests.exceptions.RequestException as e:
                     st.error(f"Error generating comment personas: {e}")
 
-        # Display generated comment personas
         if st.session_state.comment_personas:
             st.subheader("Personas from YouTube Feedback")
             for persona in st.session_state.comment_personas:
