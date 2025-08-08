@@ -1,0 +1,42 @@
+{
+  "name": "PUMA India",
+  "founded": 1948,
+  "locations": [
+    "Herzogenaurach, Germany",
+    "New Delhi, India"
+  ],
+  "offerings": [
+    "Athletic and lifestyle footwear",
+    "Apparel",
+    "Accessories"
+  ],
+  "price_range": [
+    "Low-end",
+    "Mid-range",
+    "High-end"
+  ],
+  "audience": [
+    "Young adults",
+    "Fitness enthusiasts",
+    "Fashion-conscious consumers"
+  ],
+  "usp": [
+    "Diverse product range",
+    "Innovative collaborations",
+    "Seamless shopping experience"
+  ],
+  "competitors": [
+    "Adidas",
+    "Nike",
+    "Under Armour"
+  ],
+  "channels": [
+    "Social Media"
+  ],
+  "goals": [
+    "Increase brand awareness",
+    "Drive sales growth",
+    "Enhance customer engagement"
+  ],
+  "voice": "Dynamic, trend-forward, sportswear brand with a global footprint and local relevance"
+}
