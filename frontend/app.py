@@ -1,32 +1,93 @@
-import streamlit as st
-import pandas as pd
-import requests
+# backend/app.py
+
 import os
+import re
+import json
+import requests
+import pandas as pd
+import streamlit as st
+from datetime import datetime
+from requests.exceptions import RequestException
 
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
+# ─── Config ───────────────────────────────────────────────────────────────────
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
+
 st.set_page_config(page_title="Business Toolkit", layout="wide")
-
-# Sidebar
 st.sidebar.title("Tools")
 page = st.sidebar.radio("Choose a tool", ["Existing Customer", "New Customer"])
 
-# Session State Initialization
-initial_state = {
+# ─── Session State ────────────────────────────────────────────────────────────
+_INITIAL_STATE = {
     "personas_df": None,
     "personas": [],
     "business_profile": None,
     "business_summary": "",
     "followup_questions": [],
-    "competitor_videos": {},
-    "video_comments": {},
+    "competitor_videos": {},   # {competitor: [video dicts]}
+    "video_comments": {},      # {video_id: [comment per question]}
     "comment_personas": [],
-    "biz_defaults": {}
+    "biz_defaults": {},        # autofill defaults from website extraction
 }
-for key, val in initial_state.items():
-    if key not in st.session_state:
-        st.session_state[key] = val
+for k, v in _INITIAL_STATE.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ---------------- Existing Customer ----------------
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def _api_post(path: str, payload: dict, timeout: int = 60) -> dict:
+    """POST to backend with consistent error handling."""
+    url = f"{API_BASE}/{path.lstrip('/')}"
+    try:
+        r = requests.post(url, json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json() if r.content else {}
+    except requests.exceptions.Timeout:
+        st.error("🕒 Request timed out. Try again.")
+        raise
+    except RequestException as e:
+        detail = None
+        if getattr(e, "response", None) is not None:
+            try:
+                detail = e.response.json().get("detail")
+            except Exception:
+                detail = None
+        st.error(f"API error: {e}{f' — {detail}' if detail else ''}")
+        raise
+
+
+def _reset_keys(keys):
+    for k in keys:
+        st.session_state[k] = _INITIAL_STATE[k]
+
+
+def _valid_url(url: str) -> bool:
+    return bool(re.match(r"^https?://", url.strip()))
+
+
+def _year_or_default(raw, default: int) -> int:
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _map_video_comments_to_questions(video_comments: dict, questions: list[str]) -> dict[str, list[str]]:
+    """
+    Convert {video_id: [c_for_q1, c_for_q2, ...]} to {question_text: [comments_across_videos]}.
+    Ensures /comment_personas receives the expected shape.
+    """
+    qmap: dict[str, list[str]] = {q: [] for q in questions}
+    for _vid, comments in (video_comments or {}).items():
+        for i, q in enumerate(questions):
+            if i < len(comments):
+                c = (comments[i] or "").strip()
+                if c:
+                    qmap[q].append(c)
+    # Drop empty lists to avoid empty personas
+    return {q: cs for q, cs in qmap.items() if cs}
+
+
+# ─── Existing Customer Flow ───────────────────────────────────────────────────
 if page == "Existing Customer":
     st.title("Persona Builder (Existing Customer)")
     uploaded = st.file_uploader("Upload CSV (must include `customer_id`)", type="csv")
@@ -36,8 +97,7 @@ if page == "Existing Customer":
         generate_clicked = st.button("Generate Personas")
     with col2:
         if st.button("Reset Data"):
-            for k in ["personas_df", "personas"]:
-                st.session_state[k] = initial_state[k]
+            _reset_keys(["personas_df", "personas"])
             st.rerun()
 
     if generate_clicked:
@@ -45,24 +105,29 @@ if page == "Existing Customer":
             st.warning("Please upload a CSV file.")
             st.stop()
 
-        df = pd.read_csv(uploaded)
+        try:
+            df = pd.read_csv(uploaded)
+        except Exception as e:
+            st.error(f"Failed to read CSV: {e}")
+            st.stop()
+
         if "customer_id" not in df.columns:
             st.error("CSV missing required column: `customer_id`.")
             st.stop()
 
-        df = df.fillna({col: "" if df[col].dtype == object else df[col].median() for col in df.columns})
+        # Fill NaNs (strings -> "", numerics -> median)
+        df = df.copy()
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].fillna(df[col].median())
+            else:
+                df[col] = df[col].fillna("")
+
         st.session_state.personas_df = df
 
-        try:
-            resp = requests.post(
-                f"{API_BASE}/process_profiles",
-                json={"profiles": df.to_dict(orient="records")},
-                timeout=120
-            )
-            resp.raise_for_status()
-            st.session_state.personas = resp.json().get("personas", [])
-        except requests.exceptions.RequestException as e:
-            st.error(f"API Error: {e}")
+        with st.spinner("Generating personas…"):
+            data = _api_post("process_profiles", {"profiles": df.to_dict(orient="records")}, timeout=180)
+            st.session_state.personas = data.get("personas", [])
 
     if st.session_state.personas_df is not None:
         st.subheader("Data Sample")
@@ -73,148 +138,193 @@ if page == "Existing Customer":
         for persona in st.session_state.personas:
             st.json(persona)
 
-# ---------------- New Customer ----------------
+# ─── New Customer Flow ────────────────────────────────────────────────────────
 else:
     st.title("New Customer Onboarding")
 
-    # Auto-fill inputs
+    # Auto-fill from website (abstracted settings)
     auto = st.checkbox("🌐 Auto-fill from website")
     if auto:
         website_url = st.text_input("Website URL", placeholder="https://example.com")
-        max_pages = st.number_input("Max pages to scrape", min_value=1, max_value=100, value=25)
-        max_workers = st.number_input("Number of workers (threads)", min_value=1, max_value=10, value=2)
         if st.button("Fetch data from site"):
-            try:
-                resp = requests.post(
-                    f"{API_BASE}/extract_business_info",
-                    json={"website_url": website_url, "max_pages": max_pages, "max_workers": max_workers},
-                    timeout=120
-                )
-                resp.raise_for_status()
-                st.session_state.biz_defaults = resp.json()
+            if not _valid_url(website_url):
+                st.error("Please enter a valid URL starting with http:// or https://")
+            else:
+                with st.spinner("Fetching & analyzing site…"):
+                    # NOTE: No max_pages / max_workers shown or sent; backend defaults apply.
+                    st.session_state.biz_defaults = _api_post(
+                        "extract_business_info",
+                        {"website_url": website_url},
+                        timeout=180,
+                    )
                 st.success("Auto-fill data loaded. You can tweak the fields below.")
-            except requests.exceptions.RequestException as e:
-                st.error(f"Error fetching auto-fill data: {e}")
 
-    # Prepare defaults
+    # Prepare defaults for the form
     raw = st.session_state.biz_defaults or {}
-    defaults = {
-        "name": raw.get("name", ""),
-        "founded": raw.get("founded", ""),
-        "locations": ", ".join(raw.get("locations", [])),
-        "offerings": ", ".join(raw.get("offerings", [])),
-        "price_range": raw.get("price_range", ""),
-        "audience": ", ".join(raw.get("audience", [])),
-        "usp": raw.get("usp", ""),
-        "competitors": raw.get("competitors", []),
-        "goals": "; ".join(raw.get("goals", []))
-    }
     ui_channel_options = ["Email", "Social Media", "Events", "SEO", "Partnerships", "Paid Ads"]
-    defaults["channels"] = [opt for opt in ui_channel_options if opt.lower() in [c.lower() for c in raw.get("channels", [])]]
+
+    defaults = {
+        "name": raw.get("name", "") or "",
+        "founded": raw.get("founded", "") or "",
+        "locations": ", ".join(raw.get("locations", []) or []),
+        "offerings": ", ".join(raw.get("offerings", []) or []),
+        "price_range": raw.get("price_range", "") or "",
+        "audience": ", ".join(raw.get("audience", []) or []),
+        "usp": raw.get("usp", "") or "",
+        "competitors": raw.get("competitors", []) or [],
+        "channels": [opt for opt in ui_channel_options if opt.lower() in [c.lower() for c in (raw.get("channels", []) or [])]],
+        "goals": "; ".join(raw.get("goals", []) or []),
+    }
 
     # Business profile form
     with st.form("biz_form"):
         name = st.text_input("Business Name", value=defaults["name"])
-        raw_founded = defaults.get("founded", "")
-        try:
-            default_founded = int(raw_founded)
-        except (ValueError, TypeError):
-            default_founded = 2023
-        founded = st.number_input("Year Founded", min_value=1900, max_value=2025, value=default_founded)
+        current_year = datetime.now().year
+        default_founded = _year_or_default(defaults["founded"], min(current_year, 2025))
+        founded = st.number_input(
+            "Year Founded",
+            min_value=1900,
+            max_value=max(current_year, 2025),
+            value=default_founded,
+        )
+
         locations = st.text_input("Location(s)", value=defaults["locations"], help="e.g. Mumbai; Pune")
         offerings = st.text_area("Products / Services (comma-separated)", value=defaults["offerings"])
         price_range = st.text_input("Price Range (e.g. ₹200–₹800)", value=defaults["price_range"])
         audience = st.text_area("Ideal Customers (demographics, region)", value=defaults["audience"])
         usp = st.text_area("Unique Selling Proposition", value=defaults["usp"])
-        competitors = st.multiselect("Key Competitors", defaults["competitors"])
+
+        # --- Competitors input UX ---
+        competitors_suggested = defaults.get("competitors", []) or []
+        custom_comp_text = ""
+        selected_from_suggestions: list[str] = []
+
+        if competitors_suggested:
+            selected_from_suggestions = st.multiselect(
+                "Key Competitors (select from suggestions)",
+                options=competitors_suggested,
+                default=[]
+            )
+            custom_comp_text = st.text_input(
+                "Add more competitors (comma-separated)",
+                placeholder="e.g., Curry House, Tandoori Express, Urban Masala",
+                help="Type any additional competitor names and hit Enter."
+            )
+        else:
+            custom_comp_text = st.text_area(
+                "Key Competitors (comma-separated)",
+                placeholder="e.g., Curry House, Tandoori Express, Urban Masala",
+                help="No suggestions available — type competitors separated by commas."
+            )
+
+        typed_custom = [c.strip() for c in (custom_comp_text or "").split(",") if c.strip()]
+        competitors = list(dict.fromkeys([*selected_from_suggestions, *typed_custom]))  # unique, keep order
+
         channels = st.multiselect("Marketing Channels", ui_channel_options, default=defaults["channels"])
         goals = st.text_area("Top 3 Goals (semicolon-separated)", value=defaults["goals"])
         submitted = st.form_submit_button("Generate Business Profile")
 
-    # Reset
+    # Reset all state
     if st.button("Reset Data"):
-        for k in initial_state.keys(): st.session_state[k] = initial_state[k]
+        _reset_keys(list(_INITIAL_STATE.keys()))
         st.rerun()
 
-    # Summarize
+    # On submit: run the entire pipeline automatically
     if submitted:
-        biz_payload = {"name": name, "founded": str(founded), "locations": locations,
-                       "offerings": offerings, "price_range": price_range,
-                       "audience": audience, "usp": usp,
-                       "competitors": competitors, "channels": channels,
-                       "goals": goals.split(";")}
-        try:
-            resp = requests.post(f"{API_BASE}/summarize_business", json={"business": biz_payload}, timeout=60)
-            resp.raise_for_status(); st.session_state.business_profile = resp.json()
-        except requests.exceptions.RequestException as e:
-            st.error(f"API Error: {e}"); st.stop()
-        try:
-            summ = requests.post(f"{API_BASE}/summarize_profile", json=st.session_state.business_profile, timeout=30)
-            summ.raise_for_status(); st.session_state.business_summary = summ.json().get("summary", "")
-        except requests.exceptions.RequestException as e:
-            st.error(f"Summary API error: {e}")
+        goals_list = [g.strip() for g in goals.split(";") if g.strip()]
+        biz_payload = {
+            "name": name.strip(),
+            "founded": str(int(founded)),
+            "locations": locations.strip(),
+            "offerings": offerings.strip(),
+            "price_range": price_range.strip(),
+            "audience": audience.strip(),
+            "usp": usp.strip(),
+            "competitors": competitors,
+            "channels": channels,
+            "goals": goals_list,
+        }
 
-    # Competitor insights
+        # Step 1: Summarize business (structured profile)
+        with st.spinner("Creating structured business profile…"):
+            st.session_state.business_profile = _api_post("summarize_business", {"business": biz_payload}, timeout=120)
+
+        # Step 2: Human-friendly summary
+        with st.spinner("Generating human-friendly summary…"):
+            summary_resp = _api_post("summarize_profile", st.session_state.business_profile, timeout=90)
+            st.session_state.business_summary = summary_resp.get("summary", "").strip()
+
+        # Step 3+: Competitor pipeline (only if competitors present)
+        comps = (st.session_state.business_profile or {}).get("competitors", []) or competitors
+        if comps:
+            # 3.1 Generate follow-up questions
+            with st.spinner("Generating competitor follow-up questions…"):
+                q_resp = _api_post(
+                    "generate_followup_queries",
+                    {"summary": st.session_state.business_summary, "topic": "competitors", "competitors": comps},
+                    timeout=60,
+                )
+                st.session_state.followup_questions = q_resp.get("questions", [])[:3]
+
+            # 3.2 Fetch competitor videos
+            vids_map: dict[str, list[dict]] = {}
+            with st.spinner("Searching top YouTube videos for competitors…"):
+                for comp in comps:
+                    try:
+                        v_resp = _api_post("youtube_search", {"query": comp, "order": "viewCount", "max_results": 5}, timeout=90)
+                        vids_map[comp] = v_resp.get("videos", [])
+                    except Exception:
+                        # already surfaced by _api_post; continue with others
+                        pass
+            st.session_state.competitor_videos = vids_map
+
+            # 3.3 Fetch per-question comments for each video
+            all_ids = [v["id"] for vids in st.session_state.competitor_videos.values() for v in vids if v.get("id")]
+            if all_ids and st.session_state.followup_questions:
+                with st.spinner("Fetching & ranking top comments per question…"):
+                    st.session_state.video_comments = _api_post(
+                        "youtube_comments_filtered",
+                        {"video_ids": all_ids, "questions": st.session_state.followup_questions},
+                        timeout=180,
+                    )
+
+                # 3.4 Generate personas from mapped comments
+                qmap = _map_video_comments_to_questions(st.session_state.video_comments, st.session_state.followup_questions)
+                if qmap:
+                    with st.spinner("Generating personas from competitor insights…"):
+                        r_p = _api_post("comment_personas", qmap, timeout=120)
+                        st.session_state.comment_personas = r_p.get("personas", [])
+        else:
+            st.info("No competitors provided — skipping competitor insights pipeline.")
+
+    # ─── Display Results (no extra clicks) ─────────────────────────────────────
     if st.session_state.business_summary:
-        st.subheader("Profile Summary"); st.write(st.session_state.business_summary)
-        # Competitor questions
-        if st.button("1. Generate Competitor Questions"):
-            try:
-                r = requests.post(f"{API_BASE}/generate_followup_queries",
-                                   json={"summary": st.session_state.business_summary,
-                                         "topic": "competitors",
-                                         "competitors": st.session_state.business_profile.get("competitors", [])}, timeout=30)
-                r.raise_for_status(); st.session_state.followup_questions = r.json().get("questions", [])
-            except requests.exceptions.RequestException as e:
-                st.error(f"Error generating questions: {e}")
+        st.subheader("Profile Summary")
+        st.write(st.session_state.business_summary)
+
         if st.session_state.followup_questions:
             st.markdown("**Competitor Follow-Up Questions:**")
-            for i, q in enumerate(st.session_state.followup_questions,1): st.write(f"{i}. {q}")
-            # Fetch videos
-            if st.button("2. Fetch Competitor Videos"):
-                vids_map = {}
-                for comp in st.session_state.business_profile.get("competitors",[]):
-                    try:
-                        r_v = requests.post(f"{API_BASE}/youtube_search",
-                                            json={"query":comp,"order":"viewCount","max_results":5},timeout=60)
-                        r_v.raise_for_status(); vids_map[comp]=r_v.json().get("videos",[])
-                    except requests.exceptions.RequestException as e:
-                        st.error(f"Error fetching videos for {comp}: {e}")
-                st.session_state.competitor_videos = vids_map
-            # Display videos
-            if st.session_state.competitor_videos:
-                st.subheader("Competitor Videos (Top 5 by Views)")
-                for comp, vids in st.session_state.competitor_videos.items():
-                    st.markdown(f"**{comp}**")
-                    for v in vids: st.write(f"- [{v['title']}]({v['url']}) — {v['viewCount']} views")
-            # Fetch comments
-            if st.button("3. Fetch Video Comments"):
-                all_ids=[vid['id'] for vids in st.session_state.competitor_videos.values() for vid in vids]
-                try:
-                    r_c= requests.post(f"{API_BASE}/youtube_comments_filtered",
-                                       json={"video_ids":all_ids,"questions":st.session_state.followup_questions},timeout=120)
-                    r_c.raise_for_status(); st.session_state.video_comments = r_c.json()
-                except requests.exceptions.Timeout:
-                    st.error("🕒 Fetching comments timed out. Try again.")
-                except requests.exceptions.RequestException as e:
-                    st.error(f"Error fetching filtered comments: {e}")
-            # Display comments
-            if st.session_state.video_comments:
-                st.subheader("Top Semantically Relevant Comments")
-                for vid, comms in st.session_state.video_comments.items():
-                    st.write(f"**Video {vid}:**")
-                    for c in comms: st.write(f"- {c}")
-            # Generate personas
-            if st.button("4. Generate Customer Personas"):
-                try:
-                    r_p = requests.post(
-                        f"{API_BASE}/comment_personas",
-                        json=st.session_state.video_comments,
-                        timeout=60
-                    )
-                    r_p.raise_for_status(); st.session_state.comment_personas = r_p.json().get("personas", [])
-                except requests.exceptions.RequestException as e:
-                    st.error(f"Error generating customer personas: {e}")
-            if st.session_state.comment_personas:
-                st.subheader("Customer Personas from Competitor Insights")
-                for persona in st.session_state.comment_personas: st.json(persona)
+            for i, q in enumerate(st.session_state.followup_questions, 1):
+                st.write(f"{i}. {q}")
+
+        if st.session_state.competitor_videos:
+            st.subheader("Competitor Videos (Top 5 by Views)")
+            for comp, vids in st.session_state.competitor_videos.items():
+                st.markdown(f"**{comp}**")
+                for v in vids:
+                    title = v.get("title", "Untitled")
+                    url = v.get("url", "")
+                    views = v.get("viewCount", 0)
+                    st.write(f"- [{title}]({url}) — {views:,} views")
+
+        if st.session_state.video_comments:
+            st.subheader("Top Semantically Relevant Comments")
+            for vid, comms in st.session_state.video_comments.items():
+                st.write(f"**Video {vid}:**")
+                for c in comms:
+                    st.write(f"- {c}")
+
+        if st.session_state.comment_personas:
+            st.subheader("Customer Personas from Competitor Insights")
+            for persona in st.session_state.comment_personas:
+                st.json(persona)
